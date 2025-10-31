@@ -9,11 +9,14 @@ show_pages([
 
     Page("prediction.py", "Flood Prediction", icon=":ocean:", in_section=False),
 
+    Page("salinity.py", "Salinity Prediction", icon=":ocean:", in_section=False),
+
+
     # Study cases
     Section("Study Cases", ":label:"),
-    Page("kameda.py", "Kameda, Japan", icon=":flag-jp:", in_section=True),
+    #Page("kameda.py", "Kameda, Japan", icon=":flag-jp:", in_section=True),
     Page("xuanthuy.py", "Xuan Thuy, Viet Nam", icon=":flag-vn:", in_section=True),
-    Page("subang.py", "Subang, Indonesia", icon=":flag-id:", in_section=True),
+    #Page("subang.py", "Subang, Indonesia", icon=":flag-id:", in_section=True),
 
     #Page("faq.py", "FAQ", "❔", in_section=False),
     #Page("contact.py", "Contact", icon="📩", in_section=False),
