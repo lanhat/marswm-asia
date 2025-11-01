@@ -3,11 +3,14 @@ streamlit==1.41.1
 folium
 streamlit_folium
 tensorflow==2.20.0
-tensorflow-io-gcs-filesystem==0.37.1
+#tensorflow-io-gcs-filesystem==0.37.1
 numpy==1.26.4
 pandas==2.2.1
 matplotlib==3.8.4
 # Keras 3 is included with TF 2.20 → DO NOT pin keras
 st_pages==0.5.1
 mapclassify
-scikit-learn==1.4.2
+#scikit-learn==1.4.2
+scikit-learn==1.5.2
+requests>=2.31.0
+chardet>=5.2.0
