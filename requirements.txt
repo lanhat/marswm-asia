@@ -1,10 +1,12 @@
+# --- UI / app ---
 streamlit==1.41.1
-st_pages==0.5.1
+st_pages==1.0.1
 requests>=2.31.0
 chardet>=5.2.0
 folium
 streamlit_folium
 
+# --- ML stack (Py 3.11 compatible) ---
 tensorflow==2.15.0.post1
 tensorflow-io-gcs-filesystem==0.34.0
 numpy==1.26.4
@@ -12,6 +14,7 @@ pandas==2.2.2
 scikit-learn==1.4.2
 matplotlib==3.8.4
 
+# --- Geo stack (wheel-only deps to avoid GDAL build) ---
 geopandas==1.1.1
 shapely==2.0.6
 pyproj==3.6.1
