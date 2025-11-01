@@ -1,58 +1,207 @@
-# salinity_streamlit.py
-# ------------------------------------------------------------
-# XTAISAL – LSTM-based Salinity Prediction (Streamlit version)
+# salinity_lstm_app.py
+# Streamlit app: XTAISAL – LSTM-based Salinity Pipeline with Upload/URL inputs
 # e-Asia project (Y. Natsuki; M. Kimura; Y. Sato; L. T. Hà; D. Hùng)
-# ------------------------------------------------------------
-import os
+
 import io
+import os
+import re
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import chardet
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
+
+# Optional: silence TF logs before importing
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import tensorflow as tf
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.models import load_model
 from tensorflow.keras.optimizers import Adam
 
-
-# --------------------------- Page setup ---------------------------
-st.set_page_config(page_title="XTAISAL – Salinity LSTM", layout="wide")
-st.title("XTAISAL – Mô hình LSTM dự báo độ mặn (EC)")
+st.set_page_config(page_title="XTAISAL – Salinity (LSTM)", layout="centered")
+st.title("XTAISAL – LSTM-based Salinity Prediction")
 st.caption("e-Asia project (Y. Natsuki; M. Kimura; Y. Sato; L. T. Hà; D. Hùng)")
+st.write(
+    "Tải dữ liệu theo **2 cách**: *Upload từ máy* hoặc *nhập URL (raw CSV)*. "
+    "Nếu dùng GitHub, **hãy dùng RAW URL**; nếu dùng Google Drive/private link, vui lòng tải file về rồi upload."
+)
 
+# ============================ Helpers (robust I/O) ============================
 
-# --------------------------- Utilities (adapted from your script) ---------------------------
-def get_range(df: pd.DataFrame, period_mini: str, period_max: str) -> pd.DataFrame:
+UA = {"User-Agent": "Mozilla/5.0 (XTAISAL/1.0)"}
+
+def _smart_read_df(file_or_text, *, skiprows=0, name="CSV"):
     """
-    Cắt theo chuỗi ký tự thời gian (ở cột 0) giống logic gốc.
-    Yêu cầu file có cột 0 là chuỗi thời gian đúng định dạng với period_mini / period_max.
+    Đọc CSV với tự động phát hiện encoding & dấu phân tách.
+    - Chấp nhận: file-like (Streamlit uploader) hoặc text (từ URL).
+    - Trả về: DataFrame (giữ nguyên tất cả cột).
     """
     try:
-        i0 = df.index[df[0] == period_mini][0]
-    except IndexError:
-        raise ValueError(f"'{period_mini}' không tìm thấy trong cột 0.")
-    try:
-        i1 = df.index[df[0] == period_max][0]
-    except IndexError:
-        raise ValueError(f"'{period_max}' không tìm thấy trong cột 0.")
-    return df.iloc[i0:i1, :]
+        # Chuẩn hoá thành bytes buffer để chardet/đọc nhiều lần
+        if hasattr(file_or_text, "read"):  # UploadedFile / file-like
+            raw = file_or_text.read()
+            if not isinstance(raw, (bytes, bytearray)):
+                # Trong một số runtime, read() có thể trả về str
+                raw = str(raw).encode("utf-8", errors="ignore")
+        elif isinstance(file_or_text, str):
+            raw = file_or_text.encode("utf-8", errors="ignore")
+        else:
+            raise ValueError("Đầu vào không phải file-like hoặc text.")
 
+        enc = chardet.detect(raw)["encoding"] or "utf-8"
+        buf = io.BytesIO(raw)
+
+        # Thử engine=python sep=None để auto detect; nếu fail, thử ; \t ,
+        tried = []
+        try:
+            df = pd.read_csv(buf, skiprows=skiprows, engine="python", sep=None, encoding=enc)
+            tried.append("sep=None")
+        except Exception:
+            buf.seek(0)
+            for sep in [";", "\t", ","]:
+                try:
+                    df = pd.read_csv(buf, skiprows=skiprows, sep=sep, encoding=enc)
+                    tried.append(f"sep='{sep}'")
+                    break
+                except Exception:
+                    buf.seek(0)
+            else:
+                raise ValueError("Không xác định được dấu phân tách.")
+        # Bỏ cột hoàn toàn rỗng
+        df = df.dropna(how="all", axis=1)
+        if df.shape[1] == 0:
+            raise ValueError("File không có cột dữ liệu sau khi loại cột rỗng.")
+        return df
+    except Exception as e:
+        raise ValueError(f"Lỗi đọc {name}: {type(e).__name__}: {e}")
+
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    """
+    Làm sạch & chuyển chuỗi → số:
+    - bỏ khoảng trắng, ký tự không phải số (giữ - và .)
+    - nếu chỉ có dấu phẩy (,) thì coi là dấu thập phân → đổi thành .
+    - nội suy & lấp khoảng trống 2 đầu
+    """
+    s = s.astype(str).str.strip()
+
+    has_comma = s.str.contains(",", regex=False).any()
+    has_dot   = s.str.contains(r"\.", regex=True).any()
+    if has_comma and not has_dot:
+        # ví dụ: 1,23  →  1.23
+        s = s.str.replace(",", ".", regex=False)
+
+    # bỏ ký tự không phải số/thập phân/dấu âm
+    s = s.str.replace(r"[^0-9\.\-]", "", regex=True)
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.interpolate(limit_direction="both").ffill().bfill()
+    return s
+
+def _fetch_url_text(url: str) -> str:
+    """GET text với user-agent & thông báo lỗi thân thiện (403/401...)."""
+    try:
+        r = requests.get(url, headers=UA, timeout=25)
+        if r.status_code == 200:
+            return r.text
+        hint = ""
+        if "github.com" in url and "raw.githubusercontent.com" not in url:
+            hint = " (Bạn đang dùng URL trang HTML. Hãy dùng **raw.githubusercontent.com/...**)."
+        if "drive.google.com" in url:
+            hint = " (Link Drive có thể riêng tư/không direct. Hãy tải về rồi upload.)"
+        raise ValueError(f"HTTP {r.status_code}{hint}")
+    except requests.RequestException as e:
+        raise ValueError(f"Không truy cập được URL: {e}")
+
+def ui_csv_input(label: str, *, skiprows=0, required=True, name="CSV",
+                 allow_url=True, default_col_idx=None, col_name_hints=()):
+    """
+    Widget nhập CSV (Upload/URL) → hiển thị preview + CHỌN CỘT.
+    - Tự động phát hiện encoding/sep.
+    - Làm sạch số & ép kiểu; nếu tất cả NaN → báo lỗi.
+    - default_col_idx: gợi ý cột mặc định (theo chỉ số).
+    - col_name_hints: gợi ý theo tên cột ('EC', 'salinity', ...)
+    Trả về: ndarray (N,1)
+    """
+    st.markdown(f"**{label}**")
+    opts = ["Upload từ máy"] + (["Nhập URL (raw CSV)"] if allow_url else [])
+    how = st.radio(f"Cách nhập {label}", opts, horizontal=True, key=f"how_{label}")
+
+    df = None
+    if how == "Upload từ máy":
+        up = st.file_uploader(f"Chọn file {label}", type=["csv"], key=f"up_{label}")
+        if up is not None:
+            df = _smart_read_df(up, skiprows=skiprows, name=name)
+    else:
+        url = st.text_input(f"URL {label} (raw CSV)", key=f"url_{label}",
+                            placeholder="https://raw.githubusercontent.com/...")
+        if url:
+            try:
+                txt = _fetch_url_text(url)
+                df = _smart_read_df(txt, skiprows=skiprows, name=f"{name} (URL)")
+            except Exception as e:
+                st.error(str(e))
+
+    if df is None:
+        if required:
+            st.info(f"Hãy cung cấp {label}.")
+        return None
+
+    st.caption(f"Xem trước 5 dòng đầu của {name}:")
+    st.dataframe(df.head(), use_container_width=True)
+
+    # Gợi ý cột theo tên hoặc theo index mặc định
+    columns = list(df.columns)
+    preselect = None
+    if col_name_hints:
+        cand = [c for c in columns if str(c).strip().lower() in [h.lower() for h in col_name_hints]]
+        if cand:
+            preselect = cand[0]
+    if preselect is None and default_col_idx is not None and default_col_idx < len(columns):
+        preselect = columns[default_col_idx]
+    if preselect is None:
+        preselect = columns[0]
+
+    col = st.selectbox(f"Chọn cột chứa {name}", options=columns,
+                       index=columns.index(preselect), key=f"{name}_col_select")
+    series_raw = df[col]
+    series_num = _coerce_numeric_series(series_raw)
+
+    if series_num.isna().all():
+        st.error(
+            f"Không thể trích số cho {name} từ cột `{col}`. "
+            "Hãy chọn cột khác hoặc kiểm tra định dạng (dấu `,`/`.`/đơn vị)."
+        )
+        st.stop()
+
+    arr = series_num.to_numpy().reshape(-1, 1)
+    return arr
+
+def to_col(x, name="var"):
+    """Series/array → float ndarray (N,1) với kiểm tra cơ bản."""
+    arr = pd.Series(x.ravel() if isinstance(x, np.ndarray) else x).astype(float).to_numpy().reshape(-1, 1)
+    if arr.size == 0:
+        raise ValueError(f"[{name}] mảng rỗng sau khi đọc.")
+    return arr
+
+def align_len(*arrs):
+    """Cắt mọi mảng về cùng độ dài nhỏ nhất."""
+    m = min(a.shape[0] for a in arrs)
+    return tuple(a[:m] for a in arrs)
+
+# ====================== Dataset creators (your functions) ======================
 
 def create_dataset_f2(salinity, Q, Tide, past_steps, future_steps, blank=30):
     X, y = [], []
     n = len(salinity)
     for i in range(past_steps, n - future_steps - blank):
-        X.append(np.hstack([
-            Q[i - past_steps:i],
-            Tide[i + blank - past_steps - 1:i + blank - 1]
-        ]))
+        X.append(np.hstack([Q[i - past_steps:i],
+                            Tide[i + blank - past_steps - 1:i + blank - 1]]))
         y.append(salinity[i + blank: i + blank + future_steps].flatten())
     return np.array(X), np.array(y)
-
 
 def create_dataset_f3(salinity, Q, Tide, past_steps, future_steps, blank=40):
     X, y = [], []
@@ -66,7 +215,6 @@ def create_dataset_f3(salinity, Q, Tide, past_steps, future_steps, blank=40):
         y.append(salinity[i + blank: i + blank + future_steps].flatten())
     return np.array(X), np.array(y)
 
-
 def create_dataset_f3_1(salinity, water_level, Q, Tide, past_steps, future_steps, blank=40):
     X, y = [], []
     n = len(water_level)
@@ -78,7 +226,6 @@ def create_dataset_f3_1(salinity, water_level, Q, Tide, past_steps, future_steps
         ]))
         y.append(salinity[i + blank: i + blank + future_steps].flatten())
     return np.array(X), np.array(y)
-
 
 def create_dataset_f4(salinity, water_level, Q, Tide, past_steps, future_steps, blank=40):
     X, y = [], []
@@ -93,223 +240,188 @@ def create_dataset_f4(salinity, water_level, Q, Tide, past_steps, future_steps, 
         y.append(salinity[i + blank: i + blank + future_steps].flatten())
     return np.array(X), np.array(y)
 
+def metrics(obs, pred):
+    obs = obs.reshape(-1)
+    pred = pred.reshape(-1)
+    if len(obs) == 0 or len(pred) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    if len(obs) != len(pred):
+        m = min(len(obs), len(pred))
+        obs, pred = obs[:m], pred[:m]
+    mse = np.mean((obs - pred) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(obs - pred))
+    denom = np.sum((obs - np.mean(obs)) ** 2)
+    nse = np.nan if denom == 0 else 1 - np.sum((obs - pred) ** 2) / denom
+    return mse, rmse, mae, nse
 
-def cal_nse(y_true, y_pred):
-    y_true = np.array(y_true).flatten()
-    y_pred = np.array(y_pred).flatten()
-    a = np.sum((y_true - y_pred) ** 2)
-    b = np.sum((y_true - np.mean(y_true)) ** 2)
-    return np.nan if b == 0 else 1 - (a / b)
+def build_lstm(input_steps, n_features, output_steps, lr=1e-3, units=64, dropout=0.2):
+    model = tf.keras.models.Sequential([
+        LSTM(units, input_shape=(input_steps, n_features), return_sequences=False, dropout=dropout),
+        Dense(32, activation='relu'),
+        Dense(output_steps)
+    ])
+    model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
+    return model
 
+# ============================ UI: Inputs & Options ============================
 
-def pair_clean(obs, pred):
-    obs = np.asarray(obs).reshape(-1)
-    pred = np.asarray(pred).reshape(-1)
-    L = min(len(obs), len(pred))
-    obs = obs[:L]
-    pred = pred[:L]
-    mask = np.isfinite(obs) & np.isfinite(pred)
-    return obs[mask], pred[mask]
+st.subheader("1) Nhập dữ liệu")
+# Theo cấu trúc các file gốc đã nêu:
+# - ts_catxuyen.csv: skiprows=4, EC thường ở cột index 2 (0-based)
+# - Q_Viettri_2409-2505.csv: Q ở cột index 1
+# - ts_connam.csv: skiprows=4, Tide ở cột index 1
 
+s_ec = ui_csv_input(
+    "EC (salinity) – ts_catxuyen.csv",
+    skiprows=2,                     # was 4 → now 3 header lines
+    name="EC",
+    allow_url=True,
+    default_col_idx=3,              # EC is the 4th column after timestamp
+    col_name_hints=("ec", "salinity", "conductivity", "ec_ms_cm", "ec_mscm"),
+)
 
-def plot2_series(y_true, y_pred, title="Observed vs Predicted Salinity Over Time"):
-    fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(y_true, label="Observed", color="#1f77b4")
-    ax.plot(y_pred, label="Predicted", color="#d62728", alpha=0.9)
-    ax.set_title(title)
-    ax.set_xlabel("Time index")
-    ax.set_ylabel("EC (mS/cm)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    return fig
+s_q = ui_csv_input(
+    "Discharge Q – Q_Viettri_2409-2505.csv",
+    skiprows=0, name="Q",
+    allow_url=True,
+    default_col_idx=1,
+    col_name_hints=("q", "discharge", "flow", "q_m3s"),
+)
 
+s_tide = ui_csv_input(
+    "Tide level – ts_connam.csv",
+    skiprows=2,                     # was 4 → align to 3 header lines like EC file
+    name="Tide",
+    allow_url=True,
+    default_col_idx=1,
+    col_name_hints=("tide", "wl", "water_level", "tide_level"),
+)
 
-# --------------------------- Sidebar: configuration ---------------------------
-with st.sidebar:
-    st.markdown("### Cấu hình")
-    mode = st.selectbox("Chế độ dự báo", ["12h–6h", "12h–12h"])
-    past_steps, future_steps = (12, 6) if mode == "12h–6h" else (12, 12)
-    blank = st.number_input("Lead (blank) [giờ]", min_value=0, max_value=240, value=40, step=1)
+st.markdown("**(Tuỳ chọn)**: Nạp **độ sâu** để chuyển sang **mực nước (WL)**")
+s_wd = ui_csv_input("Water Depth (WD) – optional",
+                    skiprows=4, name="WD",
+                    allow_url=True, required=False,
+                    default_col_idx=1,
+                    col_name_hints=("wd", "depth", "water_depth"))
 
-    feature_mode = st.selectbox(
-        "Tập biến đầu vào",
-        [
-            "f2: [Q, Tide] → EC",
-            "f3: [EC, Q, Tide] → EC",
-            "f3_1: [WL, Q, Tide] → EC",
-            "f4: [EC, WL, Q, Tide] → EC"
-        ],
-        index=3
-    )
+with st.expander("Thiết lập chuyển đổi độ sâu → mực nước (WD→WL)"):
+    riverbed_ec = st.number_input("Cao trình đáy (EC station, mm)", value=-1236, step=1)
+    riverbed_tide = st.number_input("Cao trình đáy (Tide station, mm)", value=-1251, step=1)
+    use_depth_to_wl = st.checkbox("Chuyển WD → WL (WL = WD - cao trình đáy EC)", value=True)
 
-    st.divider()
-    st.markdown("### Huấn luyện / Tải mô hình")
+st.subheader("2) Tuỳ chọn dự báo & đặc trưng")
+mode = st.selectbox("Chế độ dự báo", ["12h–6h", "12h–12h"])
+past_steps, future_steps = (12, 6) if mode == "12h–6h" else (12, 12)
+blank = st.number_input("Lead (blank) [giờ]", min_value=0, max_value=240, value=40, step=1)
+
+feature_mode = st.selectbox(
+    "Tập đặc trưng (dataset builder)",
+    [
+        "f2: [Q, Tide] → EC",
+        "f3: [EC, Q, Tide] → EC",
+        "f3_1: [WL, Q, Tide] → EC",
+        "f4: [EC, WL, Q, Tide] → EC"
+    ],
+    index=3
+)
+
+st.subheader("3) Mô hình")
+colM1, colM2 = st.columns(2)
+with colM1:
     train_new = st.checkbox("Huấn luyện trong ứng dụng", value=True)
-    uploaded_model = st.file_uploader("Hoặc tải mô hình (.h5)", type=["h5"])
+with colM2:
+    model_file = st.file_uploader("Hoặc tải mô hình .h5 đã huấn luyện", type=["h5"])
 
-    with st.expander("Siêu tham số"):
+if train_new:
+    with st.expander("Siêu tham số huấn luyện"):
         ep = st.number_input("Epochs", 1, 2000, 150, 1)
-        bs = st.number_input("Batch size", 1, 2048, 32, 1)
-        lr = float(st.number_input("Learning rate", 1e-6, 1e-1, 1e-3, format="%.6f"))
+        bs = st.number_input("Batch size", 1, 1024, 32, 1)
+        lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=1e-3, step=1e-6, format="%.6f")
+        patience = st.number_input("EarlyStopping patience", 1, 50, 5, 1)
+        min_delta = st.number_input("EarlyStopping min_delta", min_value=0.0, max_value=1.0, value=1e-4, step=1e-4, format="%.6f")
         units = st.number_input("LSTM units", 8, 512, 64, 8)
         dropout = st.slider("Dropout", 0.0, 0.8, 0.2, 0.05)
-        patience = st.number_input("EarlyStopping patience", 1, 50, 5)
-        min_delta = float(st.number_input("EarlyStopping min_delta", 0.0, 1.0, 1e-4, format="%.6f"))
+else:
+    ep = bs = lr = patience = min_delta = units = dropout = None
 
+# ============================== Run the pipeline ==============================
 
-# --------------------------- Inputs ---------------------------
-st.subheader("Dữ liệu đầu vào")
-st.write("Tải các tệp CSV **một cột**. Đối với **ts_catxuyen.csv** và **ts_connam.csv**, file cần cột 0 là chuỗi thời gian (để dùng `get_range`).")
-
-col = st.columns(3)
-with col[0]:
-    up_ts_catxuyen = st.file_uploader("`ts_catxuyen.csv` (cột 0: thời gian; cột 1: WD; cột 3: EC)", type=["csv"])
-with col[1]:
-    up_q_viettri = st.file_uploader("`Q_Viettri_2409-2505.csv` (cột 1: Q)", type=["csv"])
-with col[2]:
-    up_ts_connam = st.file_uploader("`ts_connam.csv` (cột 0: thời gian; cột 1: Tide)", type=["csv"])
-
-st.markdown("**Khoảng thời gian cắt (matching chuỗi thời gian trong cột 0):**")
-period_mini_bf = st.text_input("period_mini_bf (30-min data start)", "10/01/2024 12:00:00 AM")
-period_max_bf  = st.text_input("period_max_bf (30-min data end)",   "02/22/2025 11:30:00 PM")
-period_mini_af = st.text_input("period_mini_af (10-min data start)", "02/23/2025 12:00:00 AM")
-period_max_af  = st.text_input("period_max_af (10-min data end)",   "04/30/2025 11:10:00 PM")
-
-period_mini_Q  = st.text_input("period_mini_Q", "10/01/2024 12:00:00 AM")
-period_max_Q   = st.text_input("period_max_Q",  "04/30/2025 11:00:00 PM")
-
-st.markdown("**Cao trình đáy (mm) để chuyển WD→WL:**")
-colb = st.columns(2)
-with colb[0]:
-    riverbed_elevation_8 = st.number_input("Cao trình đáy tại trạm EC (mm)", value=-1236, step=1)
-with colb[1]:
-    riverbed_elevation_Tide = st.number_input("Cao trình đáy tại trạm triều (mm)", value=-1251, step=1)
-
-run = st.button("Chạy pipeline")
-
-
-# --------------------------- Pipeline ---------------------------
-if run:
+if st.button("🚀 Chạy pipeline dự báo mặn (LSTM)"):
     try:
-        # Load CSVs (raw)
-        if not (up_ts_catxuyen and up_q_viettri and up_ts_connam):
-            st.error("Vui lòng tải đủ 3 file: ts_catxuyen.csv, Q_Viettri_2409-2505.csv, ts_connam.csv.")
+        if s_ec is None or s_q is None or s_tide is None:
+            st.error("Vui lòng cung cấp **đủ** EC, Q và Tide.")
             st.stop()
 
-        df_8 = pd.read_csv(up_ts_catxuyen, header=None, skiprows=4)
-        df_Q = pd.read_csv(up_q_viettri, header=None)
-        df_T = pd.read_csv(up_ts_connam, header=None, skiprows=4)
+        # 1) To columns
+        ec   = to_col(s_ec,   "EC")
+        q    = to_col(s_q,    "Q")
+        tide = to_col(s_tide, "Tide")
 
-        # Giống script: chọn cột dùng
-        # df_8: [date_str, WD, EC] tại cột [0,1,3]; df_T: [date_str, Tide] tại cột [0,1]
-        # (nếu không đủ cột, báo lỗi)
-        if df_8.shape[1] < 4:
-            raise ValueError("`ts_catxuyen.csv` cần >= 4 cột (0:time,1:WD,3:EC).")
-        if df_T.shape[1] < 2:
-            raise ValueError("`ts_connam.csv` cần >= 2 cột (0:time,1:Tide).")
-        df_8 = df_8.iloc[:, [0, 1, 3]]
-        df_T = df_T.iloc[:, [0, 1]]
+        wl = None
+        if s_wd is not None:
+            wd = to_col(s_wd, "WD")
+            wl = wd - riverbed_ec if use_depth_to_wl else wd
 
-        # 30-min → 1h (lấy cách 2 dòng) cho giai đoạn trước (bf)
-        df_8_bf = get_range(df_8, period_mini_bf, period_max_bf).reset_index(drop=True)
-        df_T_bf = get_range(df_T, period_mini_bf, period_max_bf).reset_index(drop=True)
-        df_8_ec_bf = df_8_bf.iloc[::2, 2].reset_index(drop=True)  # EC
-        df_8_wd_bf = df_8_bf.iloc[::2, 1].reset_index(drop=True)  # WD
-        df_tide_bf = df_T_bf.iloc[::2, 1].reset_index(drop=True)  # Tide
-
-        # 10-min → 1h (lấy cách 6 dòng) cho giai đoạn sau (af)
-        df_8_af = get_range(df_8, period_mini_af, period_max_af).reset_index(drop=True)
-        df_T_af = get_range(df_T, period_mini_af, period_max_af).reset_index(drop=True)
-        df_8_ec_af = df_8_af.iloc[::6, 2].reset_index(drop=True)
-        df_8_wd_af = df_8_af.iloc[::6, 1].reset_index(drop=True)
-        df_tide_af = df_T_af.iloc[::6, 1].reset_index(drop=True)
-
-        # Gộp hai giai đoạn
-        df_8_ec = pd.concat([df_8_ec_bf, df_8_ec_af]).reset_index(drop=True)
-        df_8_wd = pd.concat([df_8_wd_bf, df_8_wd_af]).reset_index(drop=True)
-        df_tide = pd.concat([df_tide_bf, df_tide_af]).reset_index(drop=True)
-
-        # Q theo range
-        df_Q_rng = get_range(df_Q, period_mini_Q, period_max_Q).reset_index(drop=True)
-        if df_Q_rng.shape[1] < 2:
-            raise ValueError("`Q_Viettri_2409-2505.csv` cần >= 2 cột (cột 1 là Q).")
-        df_Q_1col = df_Q_rng.iloc[:, 1].reset_index(drop=True)
-
-        # Align min length
-        m = min(len(df_8_ec), len(df_8_wd), len(df_tide), len(df_Q_1col))
-        df_8_ec = df_8_ec.iloc[:m]
-        df_8_wd = df_8_wd.iloc[:m]
-        df_tide = df_tide.iloc[:m]
-        df_Q_1col = df_Q_1col.iloc[:m]
-
-        # Numpy column vectors
-        ec = df_8_ec.to_numpy(dtype=float).reshape(-1, 1)
-        wd = df_8_wd.to_numpy(dtype=float).reshape(-1, 1)
-        tide = df_tide.to_numpy(dtype=float).reshape(-1, 1)
-        q = df_Q_1col.to_numpy(dtype=float).reshape(-1, 1)
-
-        # Độ sâu → mực nước (WL) theo cao trình đáy
-        wl_ec = wd - riverbed_elevation_8  # mm-based, giống script
-        wl_tide = tide - riverbed_elevation_Tide  # nếu cần dùng ở nơi khác
-
-        # Chuẩn hoá
-        scaler_ec = MinMaxScaler()
-        scaler_wl = MinMaxScaler()
-        scaler_Q = MinMaxScaler()
-        scaler_T = MinMaxScaler()
-
-        scaled_ec = scaler_ec.fit_transform(ec)
-        scaled_wl = scaler_wl.fit_transform(wl_ec)
-        scaled_q = scaler_Q.fit_transform(q)
-        scaled_tide = scaler_T.fit_transform(wl_tide)  # giữ cách làm tương tự “reshaped_data_T”
-
-        # Chọn dataset builder
-        creator = feature_mode.split(":")[0]
-        if creator == "f2":
-            X, Y = create_dataset_f2(scaled_ec, scaled_q, scaled_tide, past_steps, future_steps, blank)
-            n_features = 2
-            X = X.reshape(X.shape[0], past_steps, 2)
-        elif creator == "f3":
-            X, Y = create_dataset_f3(scaled_ec, scaled_q, scaled_tide, past_steps, future_steps, blank)
-            n_features = 3
-            X = X.reshape(X.shape[0], past_steps, 3)
-        elif creator == "f3_1":
-            X, Y = create_dataset_f3_1(scaled_ec, scaled_wl, scaled_q, scaled_tide, past_steps, future_steps, blank)
-            n_features = 3
-            X = X.reshape(X.shape[0], past_steps, 3)
+        # 2) Align lengths
+        if wl is None:
+            ec, q, tide = align_len(ec, q, tide)
         else:
-            X, Y = create_dataset_f4(scaled_ec, scaled_wl, scaled_q, scaled_tide, past_steps, future_steps, blank)
+            ec, q, tide, wl = align_len(ec, q, tide, wl)
+
+        # 3) Normalize
+        scaler_ec   = MinMaxScaler()
+        scaler_q    = MinMaxScaler()
+        scaler_tide = MinMaxScaler()
+        scaler_wl   = MinMaxScaler() if wl is not None else None
+
+        ec_s   = scaler_ec.fit_transform(ec)
+        q_s    = scaler_q.fit_transform(q)
+        tide_s = scaler_tide.fit_transform(tide)
+        wl_s   = scaler_wl.fit_transform(wl) if wl is not None else None
+
+        # 4) Build dataset
+        creator_name = feature_mode.split(":")[0]
+        if creator_name == "f2":
+            X, Y = create_dataset_f2(ec_s, q_s, tide_s, past_steps, future_steps, blank=int(blank))
+            n_features = 2
+        elif creator_name == "f3":
+            X, Y = create_dataset_f3(ec_s, q_s, tide_s, past_steps, future_steps, blank=int(blank))
+            n_features = 3
+        elif creator_name == "f3_1":
+            if wl_s is None:
+                st.error("f3_1 yêu cầu Water Level (WL). Vui lòng cung cấp WD/WL.")
+                st.stop()
+            X, Y = create_dataset_f3_1(ec_s, wl_s, q_s, tide_s, past_steps, future_steps, blank=int(blank))
+            n_features = 3
+        else:  # f4
+            if wl_s is None:
+                st.error("f4 yêu cầu Water Level (WL). Vui lòng cung cấp WD/WL.")
+                st.stop()
+            X, Y = create_dataset_f4(ec_s, wl_s, q_s, tide_s, past_steps, future_steps, blank=int(blank))
             n_features = 4
-            X = X.reshape(X.shape[0], past_steps, 4)
 
         if X.size == 0:
-            st.error("Không đủ mẫu sau khi tạo cửa sổ (past_steps/future_steps/blank). Hãy điều chỉnh lại tham số.")
+            st.error("Không đủ dữ liệu sau khi áp dụng past_steps/future_steps/blank.")
             st.stop()
 
-        # Chia 6:2:2 (train:val:test)
+        X = X.reshape(X.shape[0], past_steps, n_features)
+        Y = Y.reshape(-1, future_steps)
+
+        # 5) Split 6:2:2
         X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, shuffle=False)
-        X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, shuffle=False)
+        X_train, X_val,  y_train, y_val  = train_test_split(X_train, y_train, test_size=0.25, shuffle=False)
 
-        st.success(f"Shapes → X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
+        st.write(f"**Shapes** → X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
 
-        # Huấn luyện hoặc tải model
+        # 6) Train or load model
         if train_new:
-            model = tf.keras.models.Sequential([
-                LSTM(int(units), input_shape=(X_train.shape[1], X_train.shape[2]),
-                     return_sequences=False, dropout=float(dropout)),
-                Dense(32, activation='relu'),
-                Dense(future_steps)
-            ])
-            model.compile(optimizer=Adam(learning_rate=float(lr)), loss='mse')
-
+            model = build_lstm(past_steps, n_features, future_steps, lr=float(lr),
+                               units=int(units), dropout=float(dropout))
             es = tf.keras.callbacks.EarlyStopping(
-                min_delta=float(min_delta),
-                patience=int(patience),
-                mode='auto',
-                restore_best_weights=True
+                min_delta=float(min_delta), patience=int(patience), mode="auto", restore_best_weights=True
             )
-
-            hist = model.fit(
+            history = model.fit(
                 X_train, y_train,
                 epochs=int(ep), batch_size=int(bs),
                 validation_data=(X_val, y_val),
@@ -317,104 +429,96 @@ if run:
                 verbose=0
             )
 
-            # Plot loss
-            fig_loss, ax = plt.subplots(figsize=(7, 3))
-            ax.plot(hist.history['loss'], label='Training Loss')
-            ax.plot(hist.history['val_loss'], label='Validation Loss')
-            ax.set_xlabel('Epochs'); ax.set_ylabel('MSE loss')
-            ax.set_title('Training vs Validation Loss'); ax.grid(True, alpha=0.3); ax.legend()
+            # plot loss
+            fig_loss, ax = plt.subplots(figsize=(7,3))
+            ax.plot(history.history["loss"], label="Train loss")
+            ax.plot(history.history["val_loss"], label="Val loss")
+            ax.set_title("Training vs Validation Loss (MSE)")
+            ax.set_xlabel("Epoch"); ax.set_ylabel("Loss"); ax.grid(True, alpha=0.3); ax.legend()
             st.pyplot(fig_loss, use_container_width=True)
 
-            # Save model
-            os.makedirs('output_data/model', exist_ok=True)
-            out_model = f"output_data/model/XTAISAL_{creator}_{mode.replace('–','-')}_SW_model.h5"
-            model.save(out_model, include_optimizer=False)
-            st.success(f"Đã lưu mô hình: `{out_model}`")
+            # save model
+            os.makedirs("output_data/model", exist_ok=True)
+            out_model_path = f"output_data/model/XTAISAL_{creator_name}_{mode.replace('–','-')}_SW_model.h5"
+            model.save(out_model_path, include_optimizer=False)
+            st.success(f"Đã lưu mô hình: `{out_model_path}`")
+
         else:
-            if uploaded_model is None:
-                st.error("Bạn chọn không huấn luyện. Vui lòng tải mô hình .h5.")
+            if model_file is None:
+                st.error("Chọn *Huấn luyện trong ứng dụng* hoặc tải mô hình .h5.")
                 st.stop()
-            model = load_model(uploaded_model)
-            need_steps = model.input_shape[-2]
-            need_feats = model.input_shape[-1]
-            if (need_steps, need_feats) != (past_steps, n_features):
-                st.warning(f"Mô hình cần shape ({need_steps}, {need_feats}) "
-                           f"nhưng bạn cấu hình ({past_steps}, {n_features}).")
+            model = load_model(model_file)
+            if model.input_shape[-2] != past_steps or model.input_shape[-1] != n_features:
+                st.warning(
+                    f"Mô hình .h5 yêu cầu input (steps={model.input_shape[-2]}, features={model.input_shape[-1]}) "
+                    f"không khớp (steps={past_steps}, features={n_features})."
+                )
 
-        # Đánh giá (val) và dự báo (test)
-        val_loss = float(model.evaluate(X_val, y_val, verbose=0))
-        st.info(f"Validation loss (MSE): {val_loss:.5f}")
-
-        y_val_pred = model.predict(X_val, verbose=0)
+        # 7) Predict & inverse scale
+        y_val_pred  = model.predict(X_val,  verbose=0)
         y_test_pred = model.predict(X_test, verbose=0)
 
-        # Nghịch chuẩn về EC
-        y_val_true = scaler_ec.inverse_transform(y_val.reshape(-1, 1)).reshape(-1)
-        y_val_pred_ec = scaler_ec.inverse_transform(y_val_pred.reshape(-1, 1)).reshape(-1)
-        y_test_true = scaler_ec.inverse_transform(y_test.reshape(-1, 1)).reshape(-1)
-        y_test_pred_ec = scaler_ec.inverse_transform(y_test_pred.reshape(-1, 1)).reshape(-1)
+        y_val_true   = scaler_ec.inverse_transform(y_val.reshape(-1, 1))
+        y_val_pred_i = scaler_ec.inverse_transform(y_val_pred.reshape(-1, 1))
+        y_test_true  = scaler_ec.inverse_transform(y_test.reshape(-1, 1))
+        y_test_pred_i= scaler_ec.inverse_transform(y_test_pred.reshape(-1, 1))
 
-        # Clean pairs & metrics
-        y_val_true, y_val_pred_ec = pair_clean(y_val_true, y_val_pred_ec)
-        y_test_true, y_test_pred_ec = pair_clean(y_test_true, y_test_pred_ec)
+        # 8) Metrics
+        mse_v, rmse_v, mae_v, nse_v = metrics(y_val_true,  y_val_pred_i)
+        mse_t, rmse_t, mae_t, nse_t = metrics(y_test_true, y_test_pred_i)
 
-        mse_v = float(np.mean((y_val_true - y_val_pred_ec) ** 2))
-        rmse_v = float(np.sqrt(mse_v))
-        mae_v = float(np.mean(np.abs(y_val_true - y_val_pred_ec)))
-        nse_v = cal_nse(y_val_true, y_val_pred_ec)
+        st.markdown("**Validation metrics**")
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("MSE",  f"{mse_v:.3f}" if not np.isnan(mse_v) else "NaN")
+        c2.metric("RMSE", f"{rmse_v:.3f}" if not np.isnan(rmse_v) else "NaN")
+        c3.metric("MAE",  f"{mae_v:.3f}" if not np.isnan(mae_v) else "NaN")
+        c4.metric("NSE",  f"{nse_v:.3f}" if not np.isnan(nse_v) else "NaN")
 
-        mse_t = float(np.mean((y_test_true - y_test_pred_ec) ** 2))
-        rmse_t = float(np.sqrt(mse_t))
-        mae_t = float(np.mean(np.abs(y_test_true - y_test_pred_ec)))
-        nse_t = cal_nse(y_test_true, y_test_pred_ec)
+        st.markdown("**Test metrics**")
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("MSE",  f"{mse_t:.3f}" if not np.isnan(mse_t) else "NaN")
+        c2.metric("RMSE", f"{rmse_t:.3f}" if not np.isnan(rmse_t) else "NaN")
+        c3.metric("MAE",  f"{mae_t:.3f}" if not np.isnan(mae_t) else "NaN")
+        c4.metric("NSE",  f"{nse_t:.3f}" if not np.isnan(nse_t) else "NaN")
 
-        st.subheader("Chỉ số đánh giá")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Validation**")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("MSE",  f"{mse_v:.3f}")
-            m2.metric("RMSE", f"{rmse_v:.3f}")
-            m3.metric("MAE",  f"{mae_v:.3f}")
-            m4.metric("NSE",  f"{nse_v:.3f}" if np.isfinite(nse_v) else "NaN")
-        with c2:
-            st.markdown("**Test**")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("MSE",  f"{mse_t:.3f}")
-            m2.metric("RMSE", f"{rmse_t:.3f}")
-            m3.metric("MAE",  f"{mae_t:.3f}")
-            m4.metric("NSE",  f"{nse_t:.3f}" if np.isfinite(nse_t) else "NaN")
-
-        # Plot test
-        fig_cmp = plot2_series(y_test_true, y_test_pred_ec,
-                               title=f"So sánh EC (Test) | {feature_mode.split(':')[0]} | {mode}")
+        # 9) Plot
+        fig_cmp, axc = plt.subplots(figsize=(9,3))
+        axc.plot(y_test_true,  label="EC quan trắc", color="#1f77b4")
+        axc.plot(y_test_pred_i,label="EC dự báo",   color="#d62728", alpha=0.9)
+        axc.set_title(f"So sánh EC (Test) | {creator_name} | {mode}")
+        axc.set_ylabel("EC (mS/cm)"); axc.set_xlabel("Chỉ số thời gian")
+        axc.grid(True, alpha=0.3); axc.legend()
         st.pyplot(fig_cmp, use_container_width=True)
 
-        # Xuất bảng kết quả
-        L = min(len(y_val_true), len(y_val_pred_ec), len(y_test_true), len(y_test_pred_ec))
+        # 10) Export results
         out_df = pd.DataFrame({
-            "EC_observed_val":  y_val_true[:L],
-            "EC_predicted_val": y_val_pred_ec[:L],
-            "EC_observed_test": y_test_true[:L],
-            "EC_predicted_test": y_test_pred_ec[:L],
+            "EC_observed_val":  y_val_true.reshape(-1),
+            "EC_predicted_val": y_val_pred_i.reshape(-1),
+            "EC_observed_test": y_test_true.reshape(-1),
+            "EC_predicted_test":y_test_pred_i.reshape(-1),
         })
-        buf = io.StringIO()
-        out_df.to_csv(buf, index=False)
+        csv_buf = io.StringIO()
+        out_df.to_csv(csv_buf, index=False)
         st.download_button("Tải kết quả (CSV)",
-                           data=buf.getvalue(),
-                           file_name=f"XTAISAL_{feature_mode.split(':')[0]}_{mode.replace('–','-')}_results.csv",
+                           data=csv_buf.getvalue(),
+                           file_name=f"XTAISAL_{creator_name}_{mode.replace('–','-')}_results.csv",
                            mime="text/csv")
 
-        with st.expander("Debug info"):
+        with st.expander("Thông tin gỡ lỗi"):
             st.write({
-                "X": X.shape, "Y": Y.shape,
-                "X_train": X_train.shape, "X_val": X_val.shape, "X_test": X_test.shape
+                "creator": creator_name,
+                "past_steps": past_steps, "future_steps": future_steps, "blank": blank,
+                "X.shape": X.shape, "Y.shape": Y.shape,
+                "X_train": X_train.shape, "X_val": X_val.shape, "X_test": X_test.shape,
+                "test_len_true": len(y_test_true), "test_len_pred": len(y_test_pred_i)
             })
 
     except Exception as e:
         st.error(f"Lỗi pipeline: {type(e).__name__}: {e}")
 
-
-# --------------------------- Environment tip ---------------------------
-st.info("⚙️ Gợi ý môi trường: dùng TensorFlow **2.15.x** (Py3.10/3.11) hoặc **2.20.0 (CPU)** trên Streamlit Cloud. "
-        "Tránh 2.16.1 với Py3.13. Cần `pandas`, `numpy`, `scikit-learn`, `matplotlib`, `tensorflow`.")
+# =============================== Environment tip ==============================
+st.info(
+    "📌 **Mẹo môi trường**: Trên Streamlit Cloud, ghim phiên bản TensorFlow tương thích Python, "
+    "ví dụ `tensorflow==2.15.0` hoặc `2.20.0`. Tránh `2.16.1` với Python 3.13 (không có wheels). "
+    "Các thư viện cần: `scikit-learn`, `pandas`, `numpy`, `matplotlib`, `requests`, `chardet`."
+)

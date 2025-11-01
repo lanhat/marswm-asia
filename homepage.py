@@ -9,7 +9,7 @@ show_pages([
 
     Page("prediction.py", "Flood Prediction", icon=":ocean:", in_section=False),
 
-    Page("salinity.py", "Salinity Prediction", icon=":ocean:", in_section=False),
+    Page("salinity.py", "Salinity Prediction", icon=":river:", in_section=False),
 
 
     # Study cases
