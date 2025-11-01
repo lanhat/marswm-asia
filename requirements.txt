@@ -1,6 +1,6 @@
 # --- UI / app ---
 streamlit==1.41.1
-st_pages==1.0.1
+st_pages==0.5.0
 requests>=2.31.0
 chardet>=5.2.0
 folium
