@@ -518,7 +518,7 @@ if st.button("🚀 Chạy pipeline dự báo mặn (LSTM)"):
 
 # =============================== Environment tip ==============================
 st.info(
-    "📌 **Mẹo môi trường**: Trên Streamlit Cloud, ghim phiên bản TensorFlow tương thích Python, "
+    "📌 **Trên Streamlit Cloud, ghim phiên bản TensorFlow tương thích Python, "
     "ví dụ `tensorflow==2.15.0` hoặc `2.20.0`. Tránh `2.16.1` với Python 3.13 (không có wheels). "
     "Các thư viện cần: `scikit-learn`, `pandas`, `numpy`, `matplotlib`, `requests`, `chardet`."
 )
