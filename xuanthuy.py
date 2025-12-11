@@ -74,7 +74,7 @@ with tab1:
     waterDepthMap.explore(
         m = riceMapGpdExplore,
         column = '300mm',
-        tooltip = ['CN', '100mm', '200mm', '300mm'],
+        tooltip = ['CN', '100mm', '200mm', '350mm'],
         cmap = step_waterdepth_colormap,
         color = step_waterdepth_colormap,
         name = "300 mm Max Flood Depth (m)"
